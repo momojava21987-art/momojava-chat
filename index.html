@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>momojava Web</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+
+<div class="login-overlay" id="loginScreen">
+  <div class="login-card">
+    <h2>momojava</h2>
+    <input type="text" id="username" placeholder="الاسم (للحساب الجديد)">
+    <input type="tel" id="phone" placeholder="رقم الهاتف">
+    <input type="password" id="password" placeholder="كلمة المرور">
+    <button onclick="startApp()">دخول / إنشاء حساب</button>
+    <p id="loginErr" class="err"></p>
+  </div>
+</div>
+
+<div class="app-container" id="appContainer" style="display:none;">
+  <div class="nav-sidebar">
+    <div class="nav-icon active" title="المحادثات"><i class="fa-solid fa-message"></i></div>
+    <div class="nav-icon" onclick="logout()" style="margin-top:auto;color:#ef4444;" title="تسجيل الخروج"><i class="fa-solid fa-right-from-bracket"></i></div>
+  </div>
+
+  <div class="chats-sidebar">
+    <div class="chats-header"><h3 id="meName">المحادثات</h3></div>
+    <div class="search-box"><input id="search" placeholder="ابحث عن اسم أو رقم" oninput="renderContacts()"></div>
+    <div class="chat-list" id="chatList"></div>
+  </div>
+
+  <div class="main-content" id="mainContent">
+    <div class="chat-view-header">
+      <button class="back-btn" onclick="closeChat()"><i class="fa-solid fa-arrow-right"></i></button>
+      <div class="title-wrap">
+        <h4 id="activeChatTitle">اختر صديقاً لبدء المحادثة</h4>
+        <small id="activeChatStatus"></small>
+      </div>
+      <div class="call-btns" id="callButtons" style="display:none;">
+        <button onclick="startCall('audio')" title="مكالمة صوتية"><i class="fa-solid fa-phone"></i></button>
+        <button onclick="startCall('video')" title="مكالمة فيديو"><i class="fa-solid fa-video"></i></button>
+      </div>
+    </div>
+    <div class="messages-area" id="messagesArea"></div>
+    <div class="input-bar" id="inputBar" style="display:none;">
+      <input type="text" id="msgInput" placeholder="اكتب رسالة..." autocomplete="off">
+      <i class="fa-solid fa-paper-plane action-icon send" onclick="sendText()"></i>
+    </div>
+  </div>
+</div>
+
+<div class="video-overlay" id="videoOverlay">
+  <h3 id="callStatus">جاري الاتصال...</h3>
+  <div class="videos">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <video id="localVideo" autoplay muted playsinline></video>
+  </div>
+  <button class="hangup" onclick="endCall()"><i class="fa-solid fa-phone-slash"></i> إنهاء</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const socket = io();
+const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] };
+
+let me = null, current = null, contacts = [], typingTimer = null, lastTypingSent = 0;
+let pc = null, localStream = null, callPeer = null, pendingIce = [];
+
+const fmtTime = ts => new Date(ts * 1000).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' });
+
+/* ---------- Login ---------- */
+function savedLogin() {
+  const phone = localStorage.getItem('momo_phone'), token = localStorage.getItem('momo_token');
+  return phone && token ? { phone, token } : null;
+}
+socket.on('connect', () => { const s = savedLogin(); if (s) socket.emit('login', s); });
+
+function startApp() {
+  const name = $('username').value.trim(), phone = $('phone').value.trim(), password = $('password').value;
+  if (!phone || !password) { $('loginErr').textContent = 'أدخل رقم الهاتف وكلمة المرور'; return; }
+  socket.emit('login', { name, phone, password });
+}
+['username', 'phone', 'password'].forEach(id => $(id).addEventListener('keydown', e => { if (e.key === 'Enter') startApp(); }));
+
+socket.on('login_success', d => {
+  me = d;
+  localStorage.setItem('momo_phone', d.phone);
+  localStorage.setItem('momo_token', d.token);
+  $('password').value = '';
+  $('meName').textContent = d.name;
+  $('loginScreen').style.display = 'none';
+  $('appContainer').style.display = 'flex';
+  socket.emit('get_contacts');
+});
+socket.on('login_error', d => {
+  if (d.silent) { localStorage.clear(); $('loginScreen').style.display = 'flex'; $('appContainer').style.display = 'none'; return; }
+  $('loginErr').textContent = d.message;
+});
+function logout() { localStorage.clear(); location.reload(); }
+
+/* ---------- Contacts ---------- */
+socket.on('refresh', () => { if (me) socket.emit('get_contacts'); });
+socket.on('contacts', list => { contacts = list; renderContacts(); updateHeader(); });
+socket.on('presence', d => {
+  const c = contacts.find(x => x.phone === d.phone);
+  if (c) { c.online = d.online; renderContacts(); updateHeader(); }
+});
+
+function renderContacts() {
+  const q = $('search').value.trim().toLowerCase();
+  const box = $('chatList');
+  box.innerHTML = '';
+  contacts
+    .filter(c => !q || c.name.toLowerCase().includes(q) || c.phone.includes(q))
+    .sort((a, b) => b.ts - a.ts || a.name.localeCompare(b.name))
+    .forEach(c => {
+      const item = document.createElement('div');
+      item.className = 'chat-item' + (c.phone === current ? ' active' : '');
+      item.onclick = () => selectChat(c.phone);
+
+      const av = document.createElement('div'); av.className = 'avatar'; av.textContent = c.name[0] || '?';
+      if (c.online) { const dot = document.createElement('span'); dot.className = 'dot'; av.appendChild(dot); }
+
+      const info = document.createElement('div'); info.className = 'info';
+      const top = document.createElement('div'); top.className = 'top';
+      const nm = document.createElement('b'); nm.textContent = c.name;
+      const tm = document.createElement('small'); tm.textContent = c.ts ? fmtTime(c.ts) : '';
+      top.append(nm, tm);
+      const bot = document.createElement('div'); bot.className = 'bot';
+      const last = document.createElement('small'); last.textContent = c.last || c.phone;
+      bot.appendChild(last);
+      if (c.unread) { const b = document.createElement('span'); b.className = 'badge'; b.textContent = c.unread; bot.appendChild(b); }
+      info.append(top, bot);
+
+      item.append(av, info);
+      box.appendChild(item);
+    });
+}
+
+/* ---------- Chat ---------- */
+function selectChat(phone) {
+  current = phone;
+  $('appContainer').classList.add('chat-open');
+  $('callButtons').style.display = 'flex';
+  $('inputBar').style.display = 'flex';
+  $('messagesArea').innerHTML = '';
+  updateHeader();
+  renderContacts();
+  socket.emit('get_history', { with: phone });
+  $('msgInput').focus();
+}
+function closeChat() { current = null; $('appContainer').classList.remove('chat-open'); renderContacts(); }
+
+function updateHeader() {
+  const c = contacts.find(x => x.phone === current);
+  if (!c) return;
+  $('activeChatTitle').textContent = c.name;
+  $('activeChatStatus').textContent = c.online ? 'متصل الآن' : 'غير متصل';
+}
+
+function addMessage(m) {
+  const mine = m.sender === me.phone;
+  const div = document.createElement('div');
+  div.className = 'msg ' + (mine ? 'sent' : 'received');
+  div.dataset.id = m.id;
+  const t = document.createElement('span'); t.textContent = m.content;
+  const meta = document.createElement('small'); meta.className = 'meta';
+  meta.textContent = fmtTime(m.ts) + ' ';
+  if (mine) {
+    const tick = document.createElement('span');
+    tick.className = 'tick' + (m.status === 2 ? ' read' : '');
+    tick.textContent = m.status === 0 ? '✓' : '✓✓';
+    meta.appendChild(tick);
+  }
+  div.append(t, meta);
+  const area = $('messagesArea');
+  area.appendChild(div);
+  area.scrollTop = area.scrollHeight;
+}
+
+socket.on('history', d => {
+  if (d.with !== current) return;
+  $('messagesArea').innerHTML = '';
+  d.messages.forEach(addMessage);
+});
+
+socket.on('receive_message', m => {
+  const other = m.sender === me.phone ? m.receiver : m.sender;
+  if (other === current) {
+    addMessage(m);
+    if (m.sender !== me.phone) socket.emit('mark_read', { with: other });
+  }
+  socket.emit('get_contacts');
+});
+
+socket.on('messages_read', d => {
+  if (d.by !== current) return;
+  document.querySelectorAll('.msg.sent .tick').forEach(t => { t.textContent = '✓✓'; t.classList.add('read'); });
+});
+
+socket.on('typing', d => {
+  if (d.from !== current) return;
+  $('activeChatStatus').textContent = 'يكتب الآن...';
+  clearTimeout(typingTimer);
+  typingTimer = setTimeout(updateHeader, 2000);
+});
+
+function sendText() {
+  const input = $('msgInput');
+  const content = input.value.trim();
+  if (!content || !current) return;
+  socket.emit('send_message', { to: current, content });
+  input.value = '';
+}
+$('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+$('msgInput').addEventListener('input', () => {
+  if (current && Date.now() - lastTypingSent > 1500) { lastTypingSent = Date.now(); socket.emit('typing', { to: current }); }
+});
+
+/* ---------- Calls (WebRTC) ---------- */
+async function openMedia(type) {
+  localStream = await navigator.mediaDevices.getUserMedia({ video: type === 'video', audio: true });
+  $('localVideo').srcObject = localStream;
+  $('videoOverlay').style.display = 'flex';
+}
+
+function makePC() {
+  pc = new RTCPeerConnection(rtcConfig);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.ontrack = e => { $('remoteVideo').srcObject = e.streams[0]; };
+  pc.onicecandidate = e => { if (e.candidate) socket.emit('ice', { to: callPeer, candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') $('callStatus').textContent = 'المكالمة جارية';
+    if (pc.connectionState === 'failed') endCall();
+  };
+}
+
+async function flushIce() {
+  for (const c of pendingIce) { try { await pc.addIceCandidate(c); } catch (e) { console.error(e); } }
+  pendingIce = [];
+}
+
+async function startCall(type) {
+  if (!current || pc) return;
+  callPeer = current;
+  $('callStatus').textContent = 'جاري الاتصال...';
+  try {
+    await openMedia(type);
+    makePC();
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit('call_user', { to: callPeer, type, sdp: offer });
+  } catch (err) {
+    alert('تعذر الوصول للكاميرا أو الميكروفون.');
+    cleanupCall();
+  }
+}
+
+socket.on('incoming_call', async d => {
+  if (pc) { socket.emit('end_call', { to: d.from }); return; }   // busy
+  if (!confirm(`مكالمة ${d.type === 'video' ? 'فيديو' : 'صوتية'} واردة من ${d.fromName}`)) {
+    socket.emit('end_call', { to: d.from });
+    return;
+  }
+  callPeer = d.from;
+  try {
+    await openMedia(d.type);
+    makePC();
+    await pc.setRemoteDescription(d.sdp);
+    await flushIce();
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    socket.emit('answer_call', { to: callPeer, sdp: answer });
+    $('callStatus').textContent = 'جاري الربط...';
+  } catch (err) {
+    alert('تعذر بدء المكالمة.');
+    endCall();
+  }
+});
+
+socket.on('call_answered', async d => {
+  if (!pc) return;
+  await pc.setRemoteDescription(d.sdp);
+  await flushIce();
+});
+
+socket.on('ice', async d => {
+  if (d.from !== callPeer) return;
+  const cand = new RTCIceCandidate(d.candidate);
+  if (pc && pc.remoteDescription) { try { await pc.addIceCandidate(cand); } catch (e) { console.error(e); } }
+  else pendingIce.push(cand);   // arrived before the connection was ready
+});
+
+socket.on('call_ended', d => { if (d.from === callPeer) cleanupCall(); });
+
+function endCall() { if (callPeer) socket.emit('end_call', { to: callPeer }); cleanupCall(); }
+function cleanupCall() {
+  $('videoOverlay').style.display = 'none';
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  if (pc) pc.close();
+  localStream = null; pc = null; callPeer = null; pendingIce = [];
+  $('localVideo').srcObject = null; $('remoteVideo').srcObject = null;
+}
+</script>
+</body>
+</html>
